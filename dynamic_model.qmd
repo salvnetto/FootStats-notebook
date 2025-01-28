@@ -1,0 +1,638 @@
+
+```{r}
+rm(list=ls())
+
+library(DYNMO)
+library(tidyverse)
+#library(rstan)
+library(cmdstanr)
+library(bayesplot)
+library(loo)
+library(caret)
+library(pROC)
+
+options(mc.cores = parallel::detectCores())
+#rstan_options(auto_write = TRUE) 
+```
+
+
+# Data cleaning
+
+```{r}
+process_dataframe = function(df_raw) {
+  columns_to_remove = c('comp', 'referee', 'league_name', 'league_id', 'team_opp_id', 'team_id', 'notes', 'captain')
+  
+  # Initial cleaning and transformations
+  df = df_raw %>%
+    select(-all_of(columns_to_remove)) %>%
+    mutate(
+      formation = str_remove(formation, "◆"),
+      opp.formation = str_remove(opp.formation, "◆"),
+      venue = ifelse(venue == 'Home', 1, 0)
+    )
+  
+  # Handling missing attendance data
+  df = df %>%
+    group_by(team_name, venue, season) %>%
+    mutate(attendance = ifelse(
+      is.na(attendance) & venue == 1,
+      round(mean(attendance, na.rm = TRUE)),
+      attendance
+    )) %>%
+    ungroup() %>%
+    mutate(attendance = ifelse(
+      is.na(attendance) & venue == 0,
+      round(mean(attendance, na.rm = TRUE)),
+      attendance
+    ))
+  
+  # Additional date-based calculations
+  df = df %>%
+    mutate(
+      date = ymd(date),
+      date_diff = as.numeric(difftime(max(date), date, units = "days")),
+      inv_date_diff = -log1p(date_diff)
+    )
+  
+  # Drop rows with NA and filter data
+  df = df %>%
+    #drop_na() %>%
+    filter(venue == 1) %>% 
+    filter(season == 2024)#%in% c(2024, 2023, 2022))
+  
+  # Generate team and opponent indices
+  unique_teams = unique(c(df$team_name, df$opponent))
+  df = df %>%
+    mutate(
+      team_name_index = match(team_name, unique_teams),
+      opponent_index = match(opponent, unique_teams)
+    ) %>% 
+    select(-c(8:11, 14:63)) 
+  
+  # Split into train and test datasets
+  df_train = df %>%
+    filter(round %in% 1:34 & season == 2024)
+  
+  df_test = df %>%
+    filter(round %in% 35:38 & season == 2024)
+  
+  return(list(df = df, df_train = df_train, df_test = df_test))
+}
+```
+
+```{r}
+df_raw = load_data("br", "match_history")
+
+df_processed = process_dataframe(df_raw)
+df = df_processed$df
+df_train = df_processed$df_train
+df_test = df_processed$df_test
+```
+
+# Fit
+
+```{r}
+data = list(
+  #treino
+  nrounds = length(unique(df$round)),
+  nteams = length(unique(df_train$team_name_index)),
+  ngames = nrow(df_train),
+  round_t = df_train$round,
+  team1 = df_train$team_name_index,
+  team2 = df_train$opponent_index,
+  gf= df_train$gf,
+  ga = df_train$ga,
+  #teste
+  ngames_new = nrow(df_test),
+  round_t_new = df_test$round,
+  team1_new = df_test$team_name_index,
+  team2_new = df_test$opponent_index
+)
+
+iter = 1000
+warmup = 1000
+chains = 1
+cores = 8
+control = list(max_treedepth = 15)
+```
+
+```{r}
+model1 = cmdstan_model("models/CopyOfdynamic_poisson.stan")
+
+fit1 = model1$sample(
+               data = data,
+               iter_sampling = iter,
+               iter_warmup = warmup,
+               chains = chains,
+               parallel_chains = cores,
+               max_treedepth = 15,
+               )
+fit1$save_object(file = "results/dynamic_poisson1.rds")
+```
+
+```{r}
+fit1 = readRDS("results/dynamic_poisson1.rds")
+```
+
+```{r}
+# model1 = stan_model("models/dynamic_poisson.stan", model_name = "dynamic_poisson")
+# 
+# fit1 = sampling(model1,
+#                data = data,
+#                iter = 2000,
+#                #warmup = warmup,
+#                chains = 1,
+#                cores = cores,
+#                control = control,
+#                refresh = 10
+#                )
+# saveRDS(fit1, "results/dynamic_poisson.rds")
+#fit1 = readRDS("results/dynamic_poisson.rds")
+```
+
+# Convergence
+
+
+```{r}
+fit1$diagnostic_summary()
+```
+```{r}
+fit1$summary() %>% 
+  mutate(across(where(is.numeric), ~round(.,2)))
+```
+
+
+```{r}
+pairs(fit1, pars=c("home[1,1]", "att[1,1]"))
+```
+
+
+```{r}
+print(fit1, pars=c("lp__"))
+```
+
+```{r}
+print(fit1, pars=c("att"))
+```
+
+```{r}
+print(fit1, pars=c("def"))
+```
+
+```{r}
+print(fit1, pars=c("log_lambda"))
+```
+
+```{r}
+print(fit1, pars=c("log_mu"))
+```
+
+```{r}
+draws = fit1$draws()
+
+draws_post = posterior::as_draws_rvars(draws)
+```
+
+```{r}
+team_map = df %>% 
+  distinct(team_name_index, team_name) %>% 
+  arrange(team_name_index)
+
+teams_names = setNames(
+  team_map$team_name,
+  team_map$team_name_index
+)
+as.data.frame(t(draws_of(draws_post$att)[,1,])) %>% 
+  mutate("Equipes" = unname(teams_names)) %>% 
+  pivot_longer(cols = -Equipes,
+               names_to = c("draws")) %>% 
+  select(-draws) %>% 
+
+  ggplot(aes(x = value, y = reorder(Equipes, value))) +
+    geom_boxplot(outlier.shape = NA, fill = "lightblue") +
+    labs(x= "Fator de Ataque",
+         y= "Equipes",
+         title = "Estimativas para o Fator de Ataque",
+         subtitle = "Rodada 34 - Brasileirão Série 2024") +
+    #xlim(-1.25, 1.25) + 
+    bayesplot_theme_set() +
+    grid_lines(color = "lightgrey")
+```
+
+```{r}
+team_means_long <- draws_of(draws_post$home) %>%
+  apply(c(2, 3), mean) %>%
+  as.data.frame.table() %>%
+  rename(Round = Var1, Team = Var2, Mean = Freq) %>%
+  mutate(
+    Round = as.numeric(Round),
+    Team = teams_names[as.numeric(Team)]
+  ) %>% 
+  filter(Team %in% c("Botafogo (RJ)", "Corinthians", "Palmeiras", "Atlético Mineiro"))
+
+ggplot(team_means_long, aes(x = Round, y = Mean, color = Team)) +
+  geom_line(group = team_means_long$Team) +
+  labs(
+    title = "Mean Performance by Team Across Rounds",
+    x = "Team",
+    y = "Mean Value",
+    color = "Team"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for readability
+  )
+```
+
+
+```{r}
+rhats = bayesplot::rhat(fit1)
+mcmc_rhat_hist(rhats)
+```
+
+```{r}
+#mcmc_trace(draws, pars = c("sigma_home")) + ylab("Att Botafogo")
+mcmc_trace(draws, pars = c("def[1,1]")) + ylab("Def Botafogo")
+#mcmc_trace(draws, pars = c("home[,1]")) + ylab("Home Botafogo")
+```
+
+
+```{r}
+lp_values = extract(fit1)$lp__
+
+hist(lp_values, main="Distribution of Log Posterior Density (up to a constant)")
+plot(lp_values, type='l', main="Trace Plot of Log Posterior Density")
+```
+
+```{r}
+plot(fit1, pars=c("att"))
+plot(fit1, pars=c("def"))
+plot(fit1, pars=c("home"))
+```
+
+```{r}
+traceplot(fit1, inc_warmup = T, pars = c("sigma_def"))
+```
+
+```{r}
+summary(fit1$sampler_diagnostics(), "mean", "median","max")
+```
+
+
+```{r}
+#rhats = rhat(fit1)
+mcmc_rhat(rhats)
+```
+
+
+```{r}
+mcmc_pairs(fit1, np = nuts_params(fit1), pars = c("sigma_home","sigma_att","sigma_def", "att[1,1]", "att[2,1]"),
+           off_diag_args = list(size = 0.75))
+```
+
+
+```{r}
+traceplot(fit1, inc_warmup = TRUE, pars = c("def"))
+```
+
+```{r}
+traceplot(fit1, inc_warmup = TRUE, pars = c("home"))
+```
+
+```{r}
+sampler_params = get_sampler_params(fit1, inc_warmup = TRUE)
+summary(do.call(rbind, sampler_params), digits = 2)
+```
+
+```{r}
+fit1$cmdstan_summary()
+```
+
+
+```{r}
+#rhat1 = rhat(fit1$cmdstan_summary())
+which(rhats > 1.05)
+```
+
+```{r}
+rhats = rhat(fit1)
+mcmc_rhat_hist(rhats)
+```
+
+
+```{r}
+n_eff = neff_ratio(fit1)
+problematic_params = which(n_eff < 0.1)
+which(n_eff < 0.5)
+```
+
+```{r}
+summary(fit1$summary())
+```
+
+```{r}
+fit1$diagnostic_summary()
+```
+
+
+```{r}
+ratios_cp = neff_ratio(fit1)
+mcmc_neff_hist(ratios_cp)
+```
+
+
+```{r}
+posterior = as.array(fit1)
+```
+
+
+```{r}
+mcmc_acf(draws, pars = "att[1,1]", lags = 20)
+```
+
+```{r}
+mcmc_acf(draws, pars = "sigma", lags = 20)
+```
+
+```{r}
+mcmc_acf(draws, pars = "def[1,1]", lags = 5)
+```
+
+
+```{r}
+mcmc_acf(posterior, pars = "home[1]", lags = 5)
+```
+
+
+
+# Inference
+
+```{r}
+samples = extract(fit1)
+```
+
+```{r}
+mcmc_hist(posterior, pars = c("att[1]", "def[1]", "home[1]"))
+```
+
+```{r}
+mcmc_areas(posterior,
+           pars = c("att[1]", "def[1]", "home[1]"),
+           prob = 0.95)
+```
+
+```{r}
+nomes = unique(df$team_name)
+att_df = as.data.frame(samples$att)
+colnames(att_df) = nomes
+att_df = pivot_longer(att_df, 
+                      cols = everything(), 
+                      names_to = "Times", 
+                      values_to = "Value")
+```
+
+```{r}
+ggplot(att_df, aes(x = Times, y = Value)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "Boxplot for each index (sorted by median)",
+    x = "Index (i)",
+    y = "Values"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Model Comparison
+
+```{r}
+log_lik = extract_log_lik(fit1, parameter_name = "log_lik")
+```
+
+```{r}
+waic(log_lik)
+```
+
+```{r}
+loo(log_lik)
+
+# model1_loo <- loo(log_lik_model1)
+# model2_loo <- loo(log_lik_model2)
+# compare_models <- loo_compare(model1_loo, model2_loo)
+```
+
+# Predictions
+
+```{r}
+y1_rep = draws_of(as_draws_rvars(fit1$draws())$gf_new)
+y1_obs = df_test$gf
+
+y2_rep = draws_of(as_draws_rvars(fit1$draws())$ga_new)
+y2_obs = df_test$ga
+
+z_rep = y1_rep - y2_rep
+z_obs = y1_obs - y2_obs
+```
+
+```{r}
+ppc_bars(y1_obs, y1_rep)
+ppc_bars(y2_obs, y2_rep)
+ppc_bars(z_obs, z_rep)
+```
+
+```{r}
+ppc_stat(y1_obs, y1_rep, stat = "mean")
+ppc_stat(y2_obs, y2_rep, stat = "mean")
+```
+
+```{r}
+ppc_stat(x_obs, x_rep, stat = "mean")
+ppc_stat(x_obs, x_rep, stat = "sd")
+ppc_stat(x_obs, x_rep, stat = function(x) sum(x == 0))
+```
+
+```{r}
+ppc_stat(y_obs, y_rep, stat = "mean")
+ppc_stat(y_obs, y_rep, stat = "sd")
+ppc_stat(y_obs, y_rep, stat = function(x) sum(x == 0))
+```
+
+```{r}
+ppc_stat(z_obs, z_rep, stat = "mean")
+ppc_stat(z_obs, z_rep, stat = "sd")
+ppc_stat(z_obs, z_rep, stat = function(x) sum(x == 0))
+```
+
+
+```{r}
+predict_games = function(game_index, possible_values, fit){
+  samples = rstan::extract(fit)
+  
+  x = samples$x_pred[, game_index]
+  y = samples$y_pred[, game_index]
+  
+  prob_matrix = matrix(0, nrow = length(possible_values), ncol = length(possible_values))
+  
+  for (i in possible_values) {
+    for (j in possible_values) {
+      joint_count = sum(x == i & y == j)
+      prob_matrix[i + 1, j + 1] = joint_count / length(x)
+    }
+  }
+  
+  rownames(prob_matrix) = possible_values
+  colnames(prob_matrix) = possible_values
+  
+  return(round(prob_matrix*100, 1))
+}
+```
+
+```{r}
+matrix1 = predict_games(1, 0:5, fit1)
+matrix1
+```
+
+```{r}
+sum(matrix1[lower.tri(matrix1)])
+sum(diag(matrix1))
+sum(matrix1[upper.tri(matrix1)])
+```
+
+```{r}
+predict_league = function(new_data, samples){
+  new_data$home_win = NA
+  new_data$draw = NA
+  new_data$home_lost = NA
+  
+  for(i in 1:nrow(new_data)){
+    x = draws_of(samples$gf_new)[, i]
+    y = draws_of(samples$ga_new)[, i]
+    n_preds = draws_of(samples$gf_new)[ ,i]
+    
+    new_data[i, ]$home_win = sum(x > y)/length(n_preds)
+    new_data[i, ]$draw = sum(x == y)/length(n_preds)
+    new_data[i, ]$home_lost = sum(x < y)/length(n_preds)
+  }
+  
+  predicted_games = new_data %>% 
+    mutate(
+      result_predicted = case_when(
+         home_win >= draw & home_win >= home_lost ~ 'W',  # WIN
+         draw >= home_win & draw >= home_lost ~ 'D', # DRAW
+         TRUE ~ 'L'  # LOSE
+       ),
+      sucess = if_else(result_predicted == result, 1, 0),
+      
+      favorite_actual = ifelse(result %in% c("W", "D"), "Favorite", "Underdog"),
+      favorite_predicted = case_when(
+        home_win + draw >= home_lost ~ "Favorite",
+        home_lost >= home_win + draw ~ "Underdog"
+        ),
+      
+      odds_win = home_win/(1-home_win),
+      odds_draw = draw/(1-draw),
+      odds_lose = home_lost/(1-home_lost)
+      )
+  
+  return(predicted_games)
+}
+```
+
+```{r}
+draws = posterior::as_draws_rvars(fit1$draws())
+
+df_predicted = predict_league(df_test, draws)
+```
+
+```{r}
+predicted = factor(df_predicted$result_predicted)
+actual = factor(df_predicted$result)
+
+confusionMatrix(predicted, actual)
+```
+
+```{r}
+df_predicted %>%
+  mutate(observed_probability = case_when(
+    sucess == 1 & result == "W" ~ home_win,
+    sucess == 1 & result == "D" ~ draw,
+    sucess == 1 & result == "L" ~ home_lost,
+    TRUE ~ NA_real_
+  )) %>% 
+  filter(sucess == 1) %>%
+  summarise(likelihood = prod(observed_probability, na.rm = TRUE)) %>%
+  pull(likelihood)
+```
+
+
+```{r}
+predicted_fav = factor(df_predicted$favorite_predicted)
+actual_fav = factor(df_predicted$favorite_actual)
+
+confusionMatrix(predicted_fav, actual_fav)
+```
+
+```{r}
+actual_fav = relevel(actual_fav, ref= "Underdog")
+
+ROC = roc(actual_fav ~ c(df_predicted$home_win + df_predicted$draw))
+plot(ROC, print.auc = TRUE)
+```
+
+
+
+```{r}
+predictions = df_predicted %>% 
+  filter(round == 35)
+
+predictions$h <- predictions$team_name
+predictions$a <- predictions$opponent
+game_names <- paste(predictions$h, "X", predictions$a)
+
+predictions['game_id'] <- as.factor(1:nrow(predictions))
+predictions['game_name'] <- game_names
+
+predictions = predictions %>% 
+  select(game_id, game_name, h, a, home_win, draw, home_lost)
+
+predictions_long <- gather(predictions,
+                           key = "Variable", 
+                           value = "Value",
+                           -game_id, -game_name, -h, -a)
+
+ggplot(predictions_long, aes(x = fct_rev(game_id), 
+                             y = Value, 
+                             fill = factor(Variable, levels = c("home_lost", "draw", "home_win")))) +
+  
+    geom_bar(stat = "identity", 
+             position = "stack") +
+  
+    geom_text(aes(label = scales::percent(Value, accuracy = 0.1)), 
+              position = position_stack(vjust = 0.5), 
+              color = "black",
+              size = 3.5) +
+  
+    labs(title = "", 
+         x = "", 
+         y = "") +
+  
+    scale_fill_manual(values = c("home_lost" = "#c0392b", "draw" = "#95a5a6", "home_win" = "#27ae60"),
+                      labels = c("Vitória do Time de Casa", "Empate", "Vitoria do Time de Fora"),
+                      limits = c("home_win", "draw", "home_lost")) +
+  
+    theme_minimal() +
+    theme(legend.title=element_blank(),
+          legend.position = "bottom",   # Move legend below the plot
+          legend.box = "horizontal",   # Arrange legend items horizontally
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          axis.title.y = element_blank()) +
+  
+    scale_x_discrete(labels = rev(predictions_long$game_name)) +
+  
+    coord_flip()
+```
+
