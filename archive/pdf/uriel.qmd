@@ -1,0 +1,809 @@
+---
+title: "Modelagem de Gols em Partidas de Futebol"
+author: "Salvador Alves Ferreira Netto e João Roberto Zuquim Filho"
+lang: pt
+format: 
+  pdf:
+    fontsize: 12pt
+    linestretch: 1.5
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    number-depth: 3
+    documentclass: report
+    fig-cap-location: bottom
+    fig-pos: 'H'
+    geometry:
+      - top=3cm
+      - left=3cm
+      - right=2cm
+      - bottom=2cm
+execute:
+  echo: false
+  warning: false
+  output: false
+---
+
+```{r setup}
+#| output: false
+#| echo: false
+#| warning: false
+
+rm(list=ls())
+
+library(tidyverse)
+library(cmdstanr)
+library(kableExtra)
+library(bayesplot)
+library(caret)
+library(posterior)
+library(ggrepel)
+```
+
+```{r load df}
+#| output: false
+#| echo: false
+#| warning: false
+
+df_train = read.csv("data/df_train.csv")
+df_test = read.csv("data/df_test.csv")
+
+df = rbind(df_train, df_test) %>% 
+  select(-X)
+```
+
+```{r load stan}
+#| output: false
+#| echo: false
+#| warning: false
+
+fit1 = readRDS("results/poisson.rds")
+```
+
+```{r predict_game function}
+#| output: false
+#| echo: false
+#| warning: false
+
+predict_game = function(game_index, possible_values, samples){
+  x = draws_of(samples$gf_new)[, game_index]
+  y = draws_of(samples$ga_new)[, game_index]
+
+  prob_matrix = matrix(0, nrow = length(possible_values), ncol = length(possible_values))
+  
+  for (i in possible_values) {
+    for (j in possible_values) {
+      joint_count = sum(x == i & y == j)
+      prob_matrix[i + 1, j + 1] = joint_count / length(x)
+    }
+  }
+  
+  rownames(prob_matrix) = possible_values
+  colnames(prob_matrix) = possible_values
+  
+  return(round(prob_matrix*100, 1))
+}
+```
+
+```{r predict_league function}
+#| output: false
+#| echo: false
+#| warning: false
+
+predict_league = function(new_data, samples){
+  new_data$home_win = NA
+  new_data$draw = NA
+  new_data$home_lost = NA
+  
+  for(i in 1:nrow(new_data)){
+    x = draws_of(samples$gf_new)[, i]
+    y = draws_of(samples$ga_new)[, i]
+    n_preds = draws_of(samples$gf_new)[ ,i]
+    
+    new_data[i, ]$home_win = sum(x > y)/length(n_preds)
+    new_data[i, ]$draw = sum(x == y)/length(n_preds)
+    new_data[i, ]$home_lost = sum(x < y)/length(n_preds)
+  }
+  
+  predicted_games = new_data %>% 
+    mutate(
+      result_predicted = case_when(
+         home_win >= draw & home_win >= home_lost ~ 'W',  # WIN
+         draw >= home_win & draw >= home_lost ~ 'D', # DRAW
+         TRUE ~ 'L'  # LOSE
+       ),
+      sucess = if_else(result_predicted == result, 1, 0),
+      
+      favorite_actual = ifelse(result %in% c("W", "D"), "Favorite", "Underdog"),
+      favorite_predicted = case_when(
+        home_win + draw >= home_lost ~ "Favorite",
+        home_lost >= home_win + draw ~ "Underdog"
+        ),
+      
+      odds_win = home_win/(1-home_win),
+      odds_draw = draw/(1-draw),
+      odds_lose = home_lost/(1-home_lost)
+      )
+  
+  return(predicted_games)
+}
+```
+
+# Introdução
+
+## Objetivo do Estudo
+
+O objetivo desse estudo é analisar o comportamento dos times através de resultados anteriores e fazer uma previsão para os jogos seguintes. Ou seja, estimar o número de gols que determinada equipe fará nas próximas partidas. Para isso temos os dados do Campeonato Brasileiro Série A de 2024, a análise abrange as 20 equipes participantes, contemplando um total de 380 jogos distribuídos em 38 rodadas.
+
+## Estratégia Metodológica
+
+Para garantir a robustez da modelagem, os dados foram segmentados em:
+
+- Conjunto de Treinamento: 34 rodadas iniciais (340 jogos)
+- Conjunto de Teste: 4 rodadas finais (40 jogos)
+
+Esta divisão permite uma avaliação rigorosa da capacidade preditiva do modelo.
+
+```{r table overview}
+#| output: true
+#| echo: false
+#| warning: false
+
+df_table = df %>% 
+  mutate("Placar" = paste0(df$gf, " - ", df$ga)) %>% 
+  arrange(round) %>% 
+  mutate(Jogo = row_number()) %>% 
+  select("Jogo" = Jogo,
+         "Index M." = team_name_index,
+         "Mandante" = team_name,
+         "Placar" = `Placar`,
+         "Visitante" = opponent,
+         "Index V." = opponent_index,
+         ) %>% 
+  mutate_all(as.character)
+  
+first_rows = head(df_table, 3)
+last_rows = tail(df_table, 3)
+ellipsis_row = data.frame(
+  Jogo = "...",
+  "Index M." = "...",
+  Mandante = "...",
+  Placar = "...",
+  Visitante = "...",
+  "Index V." = "..."
+)
+
+colnames(ellipsis_row) = colnames(df_table)
+
+combined_df = bind_rows(first_rows, ellipsis_row, last_rows)
+  
+kbl(combined_df) %>%
+  kable_styling(latex_options = c("striped")) %>% 
+  row_spec(0, bold = T) %>% 
+  column_spec(2, width = "4em") %>% 
+  column_spec(6, width = "4em")
+```
+
+# Modelagem
+
+Suponhamos que o interesse seria prever o resultado do jogo A x B. Através dos jogos passados, vamos obter os fatores de ataque e de defesa dos dois times. O Fator Ataque representa o comportamento do ataque de determinada equipe, ou seja, quantifica o número de gols feitos pelo time. O Fator Defesa se refere ao comportamento da defesa, ou seja, dá valores ao número de gols sofridos pela equipe. Além desses dois fatores, é usado também o Fator Campo. Esse fator é importante, pois através dele, podemos verificar se o time joga melhor em casa ou fora de casa. Dizem que para a maioria das equipes é melhor jogar em casa, mas pode ser que determinado time venha obtendo melhores resultados jogando fora de casa, durante determinado campeonato. Então é necessário colocar essa informação no modelo. Enfim, o modelo que será utilizado nesse estudo é o seguinte:
+
+Em uma partida entre as equipes $i$ (mandante) e $j$ (visitante):
+
+- $X_{i,j}$: Gols da equipe $i$ na equipe $j$.
+- $Y_{j,i}$: Gols da equipe $j$ na equipe $i$.
+
+
+Os gols seguem distribuições Poisson independentes: 
+
+$$
+X_{i,j} \mid \theta \sim \text{Poisson}(\theta_{i,j})
+$$
+$$
+Y_{j,i} \mid \theta \sim \text{Poisson}(\theta_{j,i})
+$$
+
+Temos um função de ligação $log$ e o seguinte Preditor Linear: 
+
+$$\log(\theta_{i,j}) = intercept + att_i - def_j + home$$
+$$\log(\theta_{j,i}) = intercept + att_j - def_i$$
+
+- $att$: Fator de ataque.
+- $def$: Fator de defesa.
+- $home$: Vantagem de jogar em casa.
+- $intercept$: Termo constante.
+
+
+Para cada time $(t = 1,...,T)$, temos como priori:
+
+$$ att_t \sim \text{Normal}(0, 1000), \quad def_t \sim \text{Normal}(0, 1000),$$
+$$home \sim \text{Normal}(0, 1000), \quad intercept \sim \text{Normal}(0, 1000) $$
+
+Para evitar problemas de identificabilidade adicionamos as restrições: 
+
+$$\sum_{t=1}^{T} att_t = 0 \quad \sum_{t=1}^{T} def_t = 0$$
+
+Nosso vetor $\theta$ contém ao todo 42 parâmetros:
+
+$$\theta = (att_{1}, ..., att_{T}, def_{1}, ..., def_{T}, home, intercept)$$
+
+# Análise Preliminar
+
+Foi feita a suposição de que os gols de cada time seguem duas distribuições de Poisson independentes. Abaixo, apresentamos a distribuição dos gols. No entanto, observamos que sofremos de subdispersão nos gols dos mandantes, o que pode violar o pressuposto da distribuição de Poisson, que assume média e variância constantes. Essa subdispersão sugere que a variabilidade nos gols dos times mandantes é menor do que a esperada, o que pode afetar a precisão do modelo e comprometer sua adequação à distribuição de Poisson.
+
+```{r mean and var of data}
+#| output: true
+#| echo: false
+#| warning: false
+
+
+medias_var = t(matrix(
+  c(round(mean(df$gf, na.rm = TRUE),2), 
+    round(var(df$gf, na.rm = TRUE), 2),
+    round(mean(df$ga, na.rm = TRUE), 2), 
+    round(var(df$ga, na.rm = TRUE), 2)), 
+  nrow = 2, 
+  ncol = 2,
+  dimnames = list(
+    c("Média", "Variância"), 
+    c("Gols mandante", "Gols visitante")
+  )
+))
+
+kbl(medias_var) %>%
+  kable_styling(latex_options = c("striped")) %>% 
+  row_spec(0, bold = T)
+```
+
+```{r distribuition of data}
+#| output: true
+#| echo: false
+#| warning: false
+
+df %>% 
+  select("Gols mandante" = gf,
+         "Gols visitante" = ga) %>% 
+  pivot_longer(cols = c(`Gols mandante`, `Gols visitante`),
+               names_to = "gols") %>% 
+  ggplot(aes(x = value)) +
+    geom_bar(fill = "#004d8eff", color = "#0b5394ff") +
+    labs(
+      title = "Distribuição dos Gols",
+      x = "Número de gols",
+      y = "Frequência"
+    ) +
+    theme_minimal() +
+    facet_grid(~gols)
+```
+
+# Convergência
+
+Foi utilizado o método MCMC por meio do software STAN, com a execução de 5.000 iterações, das quais 2.500 foram de "burn-in".
+
+```{r traceplot}
+#| output: true
+#| echo: false
+#| warning: false
+
+draws = posterior::as_draws_rvars(fit1$draws())
+
+p1 = mcmc_trace(draws, pars = c("att[1]")) + ylab("Att Botafogo")
+p2 = mcmc_trace(draws, pars = c("def[2]")) + ylab("Def Palmeiras")
+p3 = mcmc_trace(draws, pars = c("home")) + ylab("Home")
+p4 = mcmc_trace(draws, pars = c("beta_0")) + ylab("Intercept")
+
+bayesplot_grid(plots = list(p1, p2, p3, p4))
+```
+
+A análise de convergência dos parâmetros do modelo foi realizada com base nos gráficos fornecidos. Inicialmente, os gráficos das cadeias de Markov indicam que todas as cadeias estão bem misturadas, sem padrões evidentes de tendência ou deriva ao longo das iterações. A sobreposição entre as cadeias sugere que o modelo explorou adequadamente o espaço amostral, reforçando a hipótese de convergência.
+A estatística `rhat` utilizada para avaliar a convergência das cadeias, apresenta valores próximos de 1 para todos os parâmetros analisados. Isso indica que a variação entre as cadeias é semelhante à variação dentro de cada cadeia individualmente, o que sugere uma convergência satisfatória. Além disso, não há evidências de valores significativamente acima de 1.05, o que reforça a estabilidade entre as cadeias.
+
+```{r rhat and neff}
+#| output: true
+#| echo: false
+#| warning: false
+
+rhats = bayesplot::rhat(fit1)
+ratios_cp = neff_ratio(fit1)
+
+prhat = mcmc_rhat_hist(rhats)
+pnepp = mcmc_neff_hist(ratios_cp)
+
+
+bayesplot_grid(plots = list(prhat, pnepp))
+```
+
+```{r acf}
+#| output: true
+#| echo: false
+#| warning: false
+
+pacf1 = mcmc_acf(draws, pars = c("att[1]")) + ylab("Att Botafogo")
+pacf2 = mcmc_acf(draws, pars = c("def[2]")) + ylab("Def Palmeiras")
+
+bayesplot_grid(plots = list(pacf1, pacf2),
+               grid_args = list(nrow = 1, ncol = 2))
+```
+A análise da efetividade das amostras, representada pela razão $N_{eff}/N$, mostra que a maioria dos parâmetros apresenta valores acima de 0.5, indicando que o número efetivo de amostras é adequado para inferências confiáveis. Isso sugere que as cadeias foram suficientemente longas e que a variabilidade entre as amostras não compromete a precisão das estimativas.
+
+Por fim, a avaliação da autocorrelação ao longo dos lags demonstra uma queda rápida nos primeiros valores e uma estabilização próxima de zero. Esse comportamento indica uma boa mistura das cadeias e sugere que as amostras extraídas são suficientemente independentes, favorecendo uma amostragem eficiente. Dessa forma, os resultados obtidos pelo modelo podem ser considerados confiáveis para análises posteriores.
+
+# Inferência
+
+## Estimativas dos Parâmetros
+
+Utilizando o estimador de Bayes, supondo perda quadrática, obtivemos os seguintes valores para os fatores: $\text{home} = 0.33$ e $\text{intercept} = -0.06$. Abaixo, apresentamos os fatores de ataque e defesa para todos os times do Campeonato Brasileiro.
+
+```{r team names}
+#| output: false
+#| echo: false
+#| warning: false
+
+team_map = df %>% 
+  distinct(team_name_index, team_name) %>% 
+  arrange(team_name_index)
+
+teams_names = setNames(
+  team_map$team_name,
+  team_map$team_name_index
+)
+```
+
+```{r att tbl}
+#| output: true
+#| echo: false
+#| warning: false
+#| tbl-cap: "Fatores de Ataque"
+att_tbl = as.data.frame(draws_of(draws$att)) %>%
+  summarise(across(everything(), 
+                   list(mean = ~mean(.),
+                        `2.5%` = ~quantile(., 0.025),
+                        median = ~median(.), 
+                        `97.5%` = ~quantile(., 0.975)),
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(cols = everything(),
+               names_to = c("Equipes", "Statistic"),
+               names_sep = "_") %>%
+  pivot_wider(names_from = Statistic, values_from = value) %>% 
+  mutate(across(c(mean, `2.5%`, median, `97.5%`), \(x) round(x, 2)),
+         "Equipes" = unname(teams_names)) %>% 
+  rename("Média" = mean,
+         "50%" = median) %>% 
+  arrange(Equipes)
+
+kbl(att_tbl) %>%
+  kable_styling(latex_options = c("striped")) %>% 
+  row_spec(0, bold = T)
+```
+
+```{r def tbl}
+#| output: true
+#| echo: false
+#| warning: false
+#| tbl-cap: "Fatores de Defesa"
+def_tbl = as.data.frame(draws_of(draws$def)) %>%
+  summarise(across(everything(), 
+                   list(mean = ~mean(.),
+                        `2.5%` = ~quantile(., 0.025),
+                        median = ~median(.), 
+                        `97.5%` = ~quantile(., 0.975)),
+                   .names = "{.col}_{.fn}")) %>%
+  pivot_longer(cols = everything(),
+               names_to = c("Equipes", "Statistic"),
+               names_sep = "_") %>%
+  pivot_wider(names_from = Statistic, values_from = value) %>% 
+  mutate(across(c(mean, `2.5%`, median, `97.5%`), \(x) round(x, 2)),
+         "Equipes" = unname(teams_names)) %>% 
+  rename("Média" = mean,
+       "50%" = median) %>% 
+  arrange(Equipes)
+
+kbl(def_tbl) %>%
+  kable_styling(latex_options = c("striped")) %>% 
+  row_spec(0, bold = T)
+```
+
+```{r boxplot att}
+#| echo: false
+#| warning: false
+#| output: false
+
+pbox_att = as.data.frame(t(draws_of(draws$att))) %>% 
+  mutate("Equipes" = unname(teams_names)) %>% 
+  pivot_longer(cols = -Equipes,
+               names_to = c("draws")) %>% 
+  select(-draws) %>%
+
+ggplot(aes(x = value, y = reorder(Equipes, value))) +
+  geom_boxplot(outlier.shape = NA, fill = "#004d8eff", color = "#0b5394ff") +
+   stat_summary(
+    fun = median,
+    geom = "crossbar", 
+    width = 1,
+    color = "white",
+    size = 0.3
+  ) +
+  labs(x = "Fator de Ataque",
+       y = "Equipes",
+       title = "Estimativas para o Fator de Ataque",
+       subtitle = "Rodada 34 - Brasileirão Série 2024") + 
+  xlim(-1.25, 1.25) +
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+```
+
+```{r plot att vs gols}
+#| output: false
+#| echo: false
+#| warning: false
+
+gf_df = df %>% 
+  group_by(team_name) %>% 
+  summarise(media = mean(gf))
+ga_df = df %>% 
+  group_by(opponent) %>% 
+  summarise(media = mean(ga))
+
+gols = gf_df %>%  
+  left_join(ga_df, by = join_by(team_name == opponent)) %>% 
+  mutate(media = (media.x + media.y)/2,
+         att = att_tbl$Média) %>% 
+  select(-media.x, -media.y)
+
+
+patt = ggplot(gols, aes(x = att, y = media, label = team_name)) +
+  geom_point(col = "black",
+             size = 2) +
+  geom_text_repel(
+    aes(label = team_name),
+    size = 3,
+    min.segment.length = 0, 
+    seed = 8
+  ) +
+  lims(x= c(-.5, .6)) +
+  labs(x= "Fator Ataque",
+       y= "Média de Gols Marcados",
+       title = "Ataque vs Média de Gols Marcados",
+       subtitle = "Rodada 34 - Brasileirão Série 2024") + 
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+```
+
+```{r}
+#| output: true
+#| echo: false
+#| warning: false
+
+mcmc_areas(draws,
+           pars = c("att[1]", "def[20]", "home", "beta_0"),
+           prob = 0.95) + ggtitle("Distribuições a Posteriori",
+                                  "Mediana e Intervalo de Credibilidade 95%")
+```
+Ao analisar algumas das distribuições a posteriori, podemos notar que os parâmetros de ataque e defesa apresentam grande variabilidade.
+
+```{r boxplot def}
+#| output: false
+#| echo: false
+#| warning: false
+
+
+pbox_def = as.data.frame(t(draws_of(draws$def))) %>% 
+  mutate("Equipes" = unname(teams_names)) %>% 
+  pivot_longer(cols = -Equipes,
+               names_to = c("draws")) %>% 
+  select(-draws) %>% 
+
+  ggplot(aes(x = value, y = reorder(Equipes, value))) +
+    geom_boxplot(outlier.shape = NA, fill = "#004d8eff", color = "#0b5394ff") +
+     stat_summary(
+      fun = median,
+      geom = "crossbar", 
+      width = 1,
+      color = "white",
+      size = 0.3
+    ) +
+    labs(x= "Fator de Defesa",
+         y= "Equipes",
+         title = "Estimativas para o Fator de Defesa",
+         subtitle = "Rodada 34 - Brasileirão Série 2024") +
+    xlim(-1.25, 1.25) + 
+    theme_minimal() +      
+    theme(
+      plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(size = 10, hjust = 0.5),
+      axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+      axis.text.x = element_text(size = 8),
+      axis.text.y = element_text(size = 10, face = "italic")
+    )
+```
+
+```{r plot def vs gols}
+#| output: false
+#| echo: false
+#| warning: false
+
+gf_df = df %>% 
+  group_by(team_name) %>% 
+  summarise(media = mean(ga))
+ga_df = df %>% 
+  group_by(opponent) %>% 
+  summarise(media = mean(gf))
+
+gols = gf_df %>%  
+  left_join(ga_df, by = join_by(team_name == opponent)) %>% 
+  mutate(media = (media.x + media.y)/2,
+         def = def_tbl$Média) %>% 
+  select(-media.x, -media.y)
+
+
+pdef = ggplot(gols, aes(x = def, y = media, label = team_name)) +
+  geom_point(col = "black",
+             size = 2) +
+  geom_text_repel(
+    size = 3,
+    min.segment.length = 0.2, 
+    seed = 42
+  ) + 
+  #geom_text(vjust= -1, size = 3) +
+  lims(y= c(0.7, 1.7),
+       x= c(-0.35, 0.5)) +
+  labs(x= "Fator Defesa",
+       y= "Média de Gols Sofridos",
+       title = "Defesa vs Média de Gols Sofridos",
+       subtitle = "Rodada 34 - Brasileirão Série 2024") + 
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+```
+
+```{r plot def e att vs gols grid}
+#| output: true
+#| echo: false
+#| warning: false
+
+pbox_att
+pbox_def
+```
+O modelo captura bem a força de ataque e defesa dos times na rodada 34. No entanto, como não incorpora aspectos temporais, ele não reflete exatamente a força dos parâmetros especificamente nessa rodada, mas sim a performance acumulada ao longo de todas as rodadas até esse ponto. Um exemplo disso é o Vasco da Gama, que teve um início de campeonato fraco, mas fez um dos melhores returnos. Ainda assim, o modelo o classifica como um time abaixo da média devido ao impacto do desempenho inicial.
+
+```{r plot def e att vs gols grid4}
+#| output: true
+#| echo: false
+#| warning: false
+
+pdef
+patt
+```
+
+```{r att vs def}
+#| output: true
+#| echo: false
+#| warning: false
+
+tibble(team = att_tbl$Equipes, 
+       att = att_tbl$Média, 
+       def = def_tbl$Média) %>% 
+  ggplot(aes(x = att, y = def, label = team)) +
+  geom_point(col = "black",
+             size = 2) +
+  geom_text_repel(
+    size = 3,
+    nudge_x = .01,
+    nudge_y = .03,
+    seed = 42
+  ) + 
+  labs(x= "Fator Ataque",
+       y= "Fator Defesa",
+       title = "Ataque vs Defesa",
+       subtitle = "Rodada 34 - Brasileirão Série 2024") + 
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+  
+```
+Os gráficos apresentados fornecem uma análise comparativa dos desempenhos ofensivos e defensivos dos times do Campeonato Brasileiro de 2024. Observamos que o modelo representa bem as médias de gols marcados e sofridos, além de capturar os melhores e piores times do campeonato.  
+
+# Predição  
+
+Para a predição, analisamos a distribuição preditiva do modelo em comparação com a distribuição dos dados de teste. Constatamos que o modelo representa bem a distribuição dos dados de teste, porém apresenta dificuldades em lidar com os zeros, um problema conhecido na distribuição de Poisson.
+
+```{r config rep}
+#| output: false
+#| echo: false
+#| warning: false
+
+gf_rep = draws_of(draws$gf_new)#extract(fit1, "gf_new")$gf_new
+gf_obs = df_test$gf
+
+ga_rep = draws_of(draws$ga_new)#extract(fit1, "ga_new")$ga_new
+ga_obs = df_test$ga
+```
+
+```{r plot dist preditiva}
+#| output: true
+#| echo: false
+#| warning: false
+
+pgf = ppc_bars(gf_obs, gf_rep)
+pga = ppc_bars(ga_obs, ga_rep)
+
+bayesplot_grid(plots = list(pgf, pga),
+               titles = c("Gols Mandante", "Gols Visitante"))
+```
+
+```{r plot dist preditiva media}
+#| output: true
+#| echo: false
+#| warning: false
+
+pgf_mean = ppc_stat(gf_obs, gf_rep, stat = "mean")
+pga_mean =ppc_stat(ga_obs, ga_rep, stat = "mean")
+
+bayesplot_grid(plots = list(pgf_mean, pga_mean),
+               titles = c("Gols Mandante", "Gols Visitante"))
+```
+
+Nosso modelo também apresenta limitações na captura da média preditiva dos gols dos times visitantes, o que pode indicar a necessidade de ajustes na modelagem para melhor representar esse aspecto do jogo.
+
+```{r prob sp vs galo}
+#| output: true
+#| echo: false
+#| warning: false
+
+prob_game = predict_game(11, 0:3, draws)
+
+prob_game_long <- as.data.frame(prob_game) %>%
+  mutate(Row = rownames(prob_game)) %>%
+  pivot_longer(-Row, names_to = "Column", values_to = "Value")
+
+ggplot(prob_game_long, aes(y = Column, x = Row, fill = Value)) +
+  geom_tile(color = "white") +  # Creates the heatmap
+  geom_text(aes(label = sprintf("%.1f%%", Value)), color = "white") +  # Add percentage text
+  scale_fill_gradient(low = "#3d85c6ff", high = "#073763ff") +  # Gradient color
+  labs(
+    title = "São Paulo (2) vs (2) Atlético Mineiro",
+    subtitle = "Brasileirão Série A - Rodada 35",
+    x = "São Paulo",
+    y = "Atlético Mineiro"
+  ) +
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+    ) + 
+  coord_flip() +
+  guides(fill = FALSE)
+```
+
+```{r df_predicted}
+#| output: false
+#| echo: false
+#| warning: false
+
+df_predicted = predict_league(df_test, draws)
+
+predictive_likelihood_1 = df_predicted %>%
+  mutate(observed_probability = case_when(
+    sucess == 1 & result == "W" ~ home_win,
+    sucess == 1 & result == "D" ~ draw,
+    sucess == 1 & result == "L" ~ home_lost,
+    TRUE ~ NA_real_
+  )) %>% 
+  filter(sucess == 1) %>%
+  summarise(likelihood = prod(observed_probability, na.rm = TRUE)) %>%
+  pull(likelihood)
+```
+
+```{r predictions df}
+#| output: false
+#| echo: false
+#| warning: false
+
+predictions = df_predicted %>% 
+  filter(round == 35)
+
+game_names = paste(predictions$team_name, "X", predictions$opponent)
+predictions['game_id'] = as.factor(1:nrow(predictions))
+predictions['game_name'] = game_names
+
+predictions = predictions %>% 
+  select(game_id, game_name, team_name, opponent, home_win, draw, home_lost, gf, ga) %>% 
+  mutate(result = paste0(gf, " - ", ga))
+```
+
+```{r table pred probs}
+#| output: true
+#| echo: false
+#| warning: false
+#| tbl-cap: "Probabilidades para a rodada 35 do Brasileirão Série A"
+
+predictions %>% 
+  mutate_at(c("home_win", "draw", "home_lost"), ~.*100) %>% 
+  mutate_at(c("home_win", "draw", "home_lost"), ~round(., 1)) %>% 
+  mutate_at(c("home_win", "draw", "home_lost"), ~paste0(.,"%")) %>% 
+  select(
+    "Partida" = game_name, 
+    "Resultado" = result,
+    "Vitória Mandante" = home_win, 
+    "Empate" = draw, 
+    "Vitória Visitante" = home_lost) %>% 
+  kbl() %>%
+  kable_styling(latex_options = c("striped")) %>% 
+  row_spec(0, bold = T) %>% 
+  column_spec(1, width = "13em") %>% 
+  column_spec(2, bold = T) %>% 
+  column_spec(3, width = "5em") %>% 
+  column_spec(4, width = "4em") %>% 
+  column_spec(5, width = "5em")
+```
+
+Nosso modelo "acertou" apenas 3 de 10 jogos. No entanto, ele tende a atribuir maior probabilidade aos resultados mais comuns, como, por exemplo, a vitória do Botafogo, campeão, jogando em casa contra o Vitória, que luta contra o rebaixamento. Além disso, observamos que o modelo atribui probabilidades relativamente baixas para empates, o que pode indicar uma limitação na representação da incerteza nos resultados.
+
+```{r}
+#| output: false
+#| echo: false
+#| warning: false
+
+expected_result = df_predicted %>%
+  group_by(result) %>%
+  summarise(real_freq = n())
+
+expected_result <- expected_result %>%
+  mutate(expected_freq = case_when(
+    result == "W" ~ round(sum(df_predicted$home_win),2),
+    result == "D" ~ round(sum(df_predicted$draw),2),
+    result == "L" ~ round(sum(df_predicted$home_lost),2),
+    TRUE ~ NA_real_
+))
+
+colnames(expected_result) <- c("Resultado", "Freqência", "Frequência Esperada")
+
+expected1 = expected_result
+```
+
+```{r}
+#| output: true
+predicted = factor(df_predicted$favorite_predicted)
+actual = factor(df_predicted$favorite_actual)
+par(mar = c(1.5, 2, 1.5, 2))
+ConfusionTableR::binary_visualiseR(train_labels = predicted,
+                                     truth_labels = actual,
+                                     class_label1 = "Favorite", 
+                                     class_label2 = "Underdog",
+                                     quadrant_col1 = "#28ACB4", 
+                                     quadrant_col2 = "#4397D2", 
+                                     custom_title = "Confusion Matrix", 
+                                     text_col = "black")
+```
+
+Para a construção da matriz de confusão, consideramos os times mandantes como favoritos, unindo as probabilidades de vitória do mandante e de empate. Dessa forma, se o time da casa vence ou empata, consideramos que o favorito prevaleceu.  
+
+Nosso modelo apresenta um grande problema de especificidade, o que indica dificuldades em identificar corretamente os casos em que o time visitante vence. No entanto, é necessário analisar se essa forma de definir favoritos e não-favoritos é realmente adequada para a avaliação do modelo, uma vez que pode influenciar diretamente a interpretação dos resultados.
+
+# Conclusões
+
+As conclusões indicam que, embora o modelo seja estatisticamente robusto e capture características gerais de desempenho dos times, ele apresenta limitações significativas na previsão de cenários específicos. Além disso, o modelo sofre por não utilizar abordagens dinâmicas para os fatores, o que limita seu poder preditivo. Portanto, é necessário realizar um estudo preditivo mais profundo para identificar as principais falhas do modelo e apontar as áreas que precisam de melhorias, a fim de aprimorar sua capacidade de previsão e adaptabilidade. Também é fundamental averiguar o impacto da subdispersão nos gols do mandante, já que isso pode afetar a aderência do modelo aos pressupostos da distribuição de Poisson.

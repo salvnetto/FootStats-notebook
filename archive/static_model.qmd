@@ -10,6 +10,7 @@ library(loo)
 library(caret)
 library(pROC)
 
+
 options(mc.cores = parallel::detectCores())
 rstan_options(auto_write = TRUE) 
 ```
@@ -104,15 +105,15 @@ data = list(
   team2_new = df_test$opponent_index
 )
 
-iter = 15000
-warmup = 5000
+iter = 2500
+warmup = 2500
 chains = 4
 cores = 8
 control = list(max_treedepth = 15)
 ```
 
 ```{r}
-model1 = cmdstan_model("models/poisson.stan")
+model1 = cmdstan_model("../models/poisson.stan")
 
 fit1 = model1$sample(
                data = data,
@@ -122,7 +123,7 @@ fit1 = model1$sample(
                parallel_chains = cores,
                max_treedepth = 15,
                )
-fit1$save_object(file = "results/poisson.rds")
+fit1$save_object(file = "../results/poisson.rds")
 #fit1 = readRDS("results/poisson.rds")
 ```
 
@@ -155,6 +156,7 @@ summary(fit1$sampler_diagnostics())
 ```{r}
 fit1$diagnostic_summary()
 ```
+
 ```{r}
 samples(fit$draws())
 ```

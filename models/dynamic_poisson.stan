@@ -17,34 +17,45 @@ data {
 }
 
 parameters {
-  matrix[nrounds, nteams] att;
-  matrix[nrounds, nteams] def;
-  matrix[nrounds, nteams] home;
-  real<lower=0.0001> sigma;
+  matrix[nrounds, nteams] att_raw;
+  matrix[nrounds, nteams] def_raw;
+  real home;
+  real<lower=0> sigma_att;
+  real<lower=0> sigma_def;
 }
 
 transformed parameters {
+  matrix[nrounds, nteams] att;
+  matrix[nrounds, nteams] def;
   vector[ngames] theta1;
   vector[ngames] theta2;
 
+  for (t in 1:nrounds){
+    att[t] = att_raw[t] - mean(att_raw[t]);
+    def[t] = def_raw[t] - mean(def_raw[t]);
+  }
+
+
   for (k in 1:ngames) {
-    theta1[k] = att[round_t[k], team1[k]] - def[round_t[k], team2[k]] + home[round_t[k], team1[k]];
+    theta1[k] = att[round_t[k], team1[k]] - def[round_t[k], team2[k]] + home;
     theta2[k] = att[round_t[k], team2[k]] - def[round_t[k], team1[k]];
   }
 }
 
 model{
   // Priors
-  sigma ~ cauchy(0, 25);
+  sigma_att ~ cauchy(0, 25);
+  sigma_def ~ cauchy(0, 25);
 
-  target += normal_lpdf(att[1] | 0, sigma);
-  target += normal_lpdf(def[1] | 0, sigma);
-  target += normal_lpdf(home[1] | 0, sigma);
+  home ~ normal(0, 10);
+
+  target += normal_lpdf(att_raw[1] | 0, sigma_att);
+  target += normal_lpdf(def_raw[1] | 0, sigma_def);
+
 
   for (t in 2:nrounds) {
-      target += normal_lpdf(att[t] | att[t-1], sigma);
-      target += normal_lpdf(def[t] | def[t-1], sigma);
-      target += normal_lpdf(home[t] | home[t-1], sigma);
+      target += normal_lpdf(att_raw[t] | att_raw[t-1], sigma_att);
+      target += normal_lpdf(def_raw[t] | def_raw[t-1], sigma_def);
   }
 
   // Likelihood
@@ -69,7 +80,7 @@ generated quantities {
 
   // Predictive distributions for test data
   for (k in 1:ngames_new) {
-    theta1_new[k] = att[round_t_new[k], team1_new[k]] - def[round_t_new[k], team2_new[k]] + home[round_t_new[k], team1_new[k]];
+    theta1_new[k] = att[round_t_new[k], team1_new[k]] - def[round_t_new[k], team2_new[k]] + home;
     theta2_new[k] = att[round_t_new[k], team2_new[k]] - def[round_t_new[k], team1_new[k]];
   }
 

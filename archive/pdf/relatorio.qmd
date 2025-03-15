@@ -1,0 +1,783 @@
+---
+title: "Modelagem de Gols em Partidas de Futebol"
+format: 
+  revealjs:
+    embed-resources: true
+    theme: fabio.scss
+    slide-number: c/t
+    code-line-numbers: true
+    incremental: false
+    transition: fade
+    progress: true
+    background-transition: fade
+    transition-speed: slow
+callout-appearance: simple
+execute:
+  echo: false
+  warning: false
+  output: false
+---
+
+```{r setup}
+rm(list=ls())
+
+library(FootStats)
+library(tidyverse)
+library(cmdstanr)
+library(kableExtra)
+#library(bayesplot)
+#library(loo)
+#library(caret)
+#library(pROC)
+```
+
+```{r loading df}
+brasileirao_a_raw = FootStats::load_data('brazil', 'brasileirao_a')
+premier_league_raw = FootStats::load_data('england', 'premier_league')
+```
+
+```{r only home view}
+brasileirao_a = brasileirao_a_raw %>% 
+  filter(venue == 'Home')
+
+premier_league = premier_league_raw %>% 
+  filter(venue == 'Home')
+```
+
+
+```{r train test}
+train_test = FootStats::split_train_test(brasileirao_a_raw, '2024', 35)
+
+df_train = train_test$train
+df_test = train_test$test
+
+df = rbind(df_train, df_test)
+```
+
+# Descritiva
+
+```{r distribuicao}
+#| output: true
+
+brasileirao_a %>% 
+  select("Gols mandante" = gf,
+         "Gols visitante" = ga) %>% 
+  pivot_longer(cols = c(`Gols mandante`, `Gols visitante`),
+               names_to = "gols") %>% 
+  ggplot(aes(x = value)) +
+    geom_bar() +
+    labs(
+      title = "Distribuição dos Gols",
+      subtitle = "Brasileirão Série A - Temporadas 2019 à 2024",
+      x = "Número de gols",
+      y = "Frequência"
+    ) +
+    theme_minimal() +
+    facet_grid(~gols)
+```
+# Descritiva
+
+
+```{r mean and var}
+#| output: true
+
+brasileirao_a %>% 
+  filter(season == '2024') %>% 
+  reframe(
+    "Média" = c(mean(gf), mean(ga)),
+    "Variância" = c(var(gf), var(ga)),
+   ) %>% 
+  mutate_all(~ round(., 2)) %>% 
+  mutate(
+    gol = c("Gols mandante", "Gols visitante")
+  ) %>% 
+  select(Gols = gol, `Média`, `Variância`) %>% 
+  kbl()
+```
+# Descritiva
+
+```{r placares}
+#| output: true
+
+brasileirao_a %>% 
+  mutate(placar = paste0(gf, "x", ga)) %>% 
+  group_by(placar) %>% 
+  count(placar) %>%
+  ungroup() %>% 
+  mutate(
+    pct = round((n / sum(n)) * 100, 1)
+  ) %>% 
+  mutate(
+      category = case_when(
+        str_detect(placar, "0x0") ~ "0x0",
+        str_detect(placar, "0") ~ "Contém 0",
+        TRUE ~ "Outro"
+      )
+    ) %>% 
+  filter(category != "Outro") %>% 
+  group_by(category) %>% 
+  summarise(
+    pct = sum(pct),
+    n = sum(n),
+    .groups = "drop"
+  ) %>% 
+  kbl(col.names = c('Placar', '%', 'N'))
+```
+# Descritiva
+
+```{r vitorias}
+#| output: true
+
+brasileirao_a %>% 
+  count(result) %>% 
+  mutate(pct = round((n / sum(n)) * 100, 1),
+         result = case_when(
+           result == "D" ~ "Empate",
+           result == "L" ~ "Visitante",
+           result == "W" ~ "Mandante",
+           TRUE ~ "Outro"
+         )) %>% 
+  kbl(col.names = c('Resultado', 'N', '%'))
+```
+
+
+# Modelagem
+
+```{r stan}
+poisson = readRDS("results/poisson.rds")
+zipoisson = readRDS("results/zipoisson.rds")
+negbinom = readRDS("results/negbinom.rds")
+dynamic = readRDS("results/dynamic_poisson.rds")
+```
+
+
+```{r draws}
+extract_draws = function(object, df) {
+  draws = posterior::as_draws_rvars(object$draws())
+  
+  team_map = df %>% 
+    distinct(team_name_idx, team_name) %>% 
+    arrange(team_name_idx)
+
+  teams_names = setNames(
+    str_to_title(str_replace_all(team_map$team_name, "_", " ")),
+    team_map$team_name_index
+  )
+  
+  draws_list = as.list(draws)
+  result = c(list(teams = teams_names), draws_list)
+  return(result)
+}
+
+poisson_draw = extract_draws(poisson, df)
+zipoisson_draw = extract_draws(zipoisson, df)
+negbinom_draw = extract_draws(negbinom, df)
+dynamic_draw = extract_draws(dynamic, df)
+```
+
+
+```{r boxplot factor}
+plot_boxplot_factors = function(draws, factor = c('att', 'def'), round = NULL) {
+  teams_names = draws$teams
+  att = posterior::draws_of(draws$att)
+  def = posterior::draws_of(draws$def)
+  if (!is.null(round)) {
+    att = att[,round,]
+    def = def[,round,]
+  }
+  
+  if (factor == 'att'){
+    variable = att
+    factor_name = 'Attack'
+  }
+  else {
+    variable = def
+    factor_name = 'Defense'
+  }
+  
+  plot = as.data.frame(t(variable)) %>% 
+    mutate("Teams" = unname(teams_names)) %>% 
+    pivot_longer(cols = -Teams,
+               names_to = c("draws")) %>% 
+    select(-draws) %>%
+    
+  ggplot(aes(x = value, y = reorder(Teams, value))) +
+  geom_boxplot(outlier.shape = NA, fill = "#004d8eff", color = "#0b5394ff") +
+   stat_summary(
+    fun = median,
+    geom = "crossbar", 
+    width = 1,
+    color = "white",
+    linewidth = 0.3
+  ) +
+  labs(x = paste0(factor_name, " Factor"),
+       y = "Teams",
+       title = paste0("Estimatives for the ", factor_name, " Factor")) + 
+  xlim(-1.5, 1.5) +
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+  
+  return(plot)
+}
+```
+
+```{r boxplot factor 2}
+#poiss
+poiss_att = plot_boxplot_factors(poisson_draw, 'att') + labs(subtitle = "Poisson - Brasileirão Série A - Round 35")
+poiss_def = plot_boxplot_factors(poisson_draw, 'def') + labs(subtitle = "Poisson - Brasileirão Série A - Round 35")
+
+#zipoiss
+zipoiss_att = plot_boxplot_factors(zipoisson_draw, 'att') + labs(subtitle = "ZIPoisson - Brasileirão Série A - Round 35")
+zipoiss_def = plot_boxplot_factors(zipoisson_draw, 'def') + labs(subtitle = "ZIPoisson - Brasileirão Série A - Round 35")
+
+#negbin
+negbin_att = plot_boxplot_factors(negbinom_draw, 'att') + labs(subtitle = "Neg. Binomial - Brasileirão Série A - Round 35")
+negbin_def = plot_boxplot_factors(negbinom_draw, 'def') + labs(subtitle = "Neg. Binomial - Brasileirão Série A - Round 35")
+
+#dynamic
+dyn_att = plot_boxplot_factors(dynamic_draw, 'att', 35) + labs(subtitle = "Dynamic Poisson - Brasileirão Série A - Round 35")
+dyn_def = plot_boxplot_factors(dynamic_draw, 'def', 35) + labs(subtitle = "Dynamic Poisson - Brasileirão Série A - Round 35")
+```
+
+```{r boxplot factor 3}
+#| output: true
+
+gridExtra::grid.arrange(
+  poiss_att,
+  zipoiss_att,
+  negbin_att,
+  dyn_att,
+  ncol = 2
+)
+```
+
+# Modelagem
+
+```{r boxplot factor 4}
+#| output: true
+gridExtra::grid.arrange(
+  poiss_def,
+  zipoiss_def,
+  negbin_def,
+  dyn_def,
+  ncol = 2
+)
+```
+# Modelagem
+
+```{r att vs def}
+plot_att_vs_def = function(draws, round = NULL) {
+  teams_names = draws$teams
+  att = posterior::draws_of(draws$att)
+  def = posterior::draws_of(draws$def)
+  if (!is.null(round)) {
+    att = att[,round,]
+    def = def[,round,]
+  }
+  
+  plot = tibble(team = teams_names, 
+       att = colMeans(att), 
+       def = colMeans(def)) %>% 
+    
+  ggplot(aes(x = att, y = def, label = team)) +
+  geom_point(col = "black",
+             size = 2) +
+  ggrepel::geom_text_repel(
+    size = 3,
+    nudge_x = .01,
+    nudge_y = .03,
+    seed = 42
+  ) + 
+  labs(x= "Attack Factor",
+       y= "Defense Factor",
+       title = "Attack vs Defense") +
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+  
+  return(plot)
+}
+
+vs_pois = plot_att_vs_def(poisson_draw) + labs(subtitle = "Poisson - Brasileirão Série A - Round 35")
+vs_zipois = plot_att_vs_def(zipoisson_draw) + labs(subtitle = "ZIPoisson - Brasileirão Série A - Round 35")
+vs_negbin = plot_att_vs_def(negbinom_draw) + labs(subtitle = "Neg. Binomial - Brasileirão Série A - Round 35")
+vs_dyn = plot_att_vs_def(dynamic_draw, 35) + labs(subtitle = "Dynamic Poisson - Brasileirão Série A - Round 35")
+```
+
+```{r}
+#| output: true
+
+gridExtra::grid.arrange(
+  vs_pois,
+  vs_zipois,
+  vs_negbin,
+  vs_dyn,
+  ncol = 2
+)
+```
+
+```{r att-def vs gols}
+plot_vs_goals = function(draws, df, factor = c('att', 'def'), round = NULL) {
+  att = posterior::draws_of(draws$att)
+  def = posterior::draws_of(draws$def)
+  if (!is.null(round)) {
+    att = att[,round,]
+    def = def[,round,]
+  }
+  
+  gf_df = df %>% 
+    group_by(team_name) %>% 
+    summarise(home_gf = mean(gf),
+              home_ga = mean(ga))
+  ga_df = df %>% 
+    group_by(opponent) %>% 
+    summarise(away_gf = mean(gf),
+              away_ga = mean(ga))
+  
+  gols = gf_df %>%  
+    left_join(ga_df, by = join_by(team_name == opponent)) %>% 
+    mutate(
+      feitos = (home_gf + away_ga)/2,
+      tomados = (home_ga + away_gf)/2,
+      att = colMeans(att),
+      def = colMeans(def),
+      team_name = str_to_title(str_replace_all(team_name, "_", " "))
+      )
+  
+  if (factor == 'att') {
+    gols = gols %>% 
+      mutate(
+        x = att,
+        y = feitos
+      )
+    factor_name = "Attack"
+    goals_name = "For"
+  }
+  else {
+    gols = gols %>% 
+      mutate(
+        x = def,
+        y = tomados
+      )
+    factor_name = "Defense"
+    goals_name = "Against"
+  }
+  plot = ggplot(gols, aes(x = x, y = y, label = team_name)) +
+  geom_point(col = "black",
+             size = 2) +
+  ggrepel::geom_text_repel(
+    size = 3,
+    min.segment.length = 0.2, 
+    seed = 42
+  ) + 
+  labs(x= paste0(factor_name, " Factor"),
+       y= paste0("Mean of Goals ", goals_name),
+       title = paste0(factor_name, " vs Mean of Goals ", goals_name)) + 
+  theme_minimal() +      
+  theme(
+    plot.title = element_text(size = 12, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 10, hjust = 0.5),
+    axis.title.x = element_text(size = 10, margin = margin(t = 10)),
+    axis.text.x = element_text(size = 8),
+    axis.text.y = element_text(size = 10, face = "italic")
+    )
+  
+  return(plot)
+}
+
+
+#attgoals_pois = plot_vs_goals(poisson_draw, df, 'att') + labs(subtitle = "Poisson - Brasileirão Série A - Round 35")
+#attgoals_zipois = plot_vs_goals(zipoisson_draw, df, 'att') + labs(subtitle = "ZIPoisson - Brasileirão Série A - Round 35")
+#attgoals_negbin = plot_vs_goals(negbinom_draw, df, 'att') + labs(subtitle = "Neg. Binomial - Brasileirão Série A - Round 35")
+#attgoals_dyn = plot_vs_goals(dynamic_draw, df, 'att', 35) + labs(subtitle = "Dynamic Poisson - Brasileirão Série A - Round #35")
+#
+#defgoals_pois = plot_vs_goals(poisson_draw, df, 'def') + labs(subtitle = "Poisson - Brasileirão Série A - Round 35")
+#defgoals_zipois = plot_vs_goals(zipoisson_draw, df, 'def') + labs(subtitle = "ZIPoisson - Brasileirão Série A - Round 35")
+#defgoals_negbin = plot_vs_goals(negbinom_draw, df, 'def') + labs(subtitle = "Neg. Binomial - Brasileirão Série A - Round 35")
+#defgoals_dyn = plot_vs_goals(dynamic_draw, df, 'def', 35) + labs(subtitle = "Dynamic Poisson - Brasileirão Série A - Round #35")
+```
+
+
+# Predição
+
+```{r plot dist preditiva}
+
+plot_predictive_dist = function(draws, df_test, title) {
+  gf_rep = posterior::draws_of(draws$gf_new)
+  gf_obs = df_test$gf
+  
+  ga_rep = posterior::draws_of(draws$ga_new)
+  ga_obs = df_test$ga
+  
+  pgf = bayesplot::ppc_bars(gf_obs, gf_rep)
+  pga = bayesplot::ppc_bars(ga_obs, ga_rep)
+  
+  grid = bayesplot::bayesplot_grid(plots = list(pgf, pga),
+                            titles = c(title, title),
+                            subtitles = c("Home Goals", "Away Goals"))
+  
+  return(grid)
+}
+
+pred_poisson = plot_predictive_dist(poisson_draw, df_test, "Poisson")
+pred_zipoisson = plot_predictive_dist(zipoisson_draw, df_test, "ZIPoisson")
+pred_neg = plot_predictive_dist(negbinom_draw, df_test, "Neg. Binom")
+pred_dyn = plot_predictive_dist(dynamic_draw, df_test, "Dynamic Poisson")
+```
+
+```{r plot dist preditiva 2}
+#| output: true
+
+pred_poisson
+```
+
+# Predição
+
+```{r plot dist preditiva 3}
+#| output: true
+pred_zipoisson
+```
+
+# Predição
+
+```{r plot dist preditiva 4}
+#| output: true
+pred_neg
+```
+
+# Predição
+
+```{r plot dist preditiva 5}
+#| output: true
+pred_dyn
+```
+
+# Predição
+
+```{r plot mean predictive}
+plot_predictive_mean = function(draws, df_test, title) {
+  gf_rep = posterior::draws_of(draws$gf_new)
+  gf_obs = df_test$gf
+  
+  ga_rep = posterior::draws_of(draws$ga_new)
+  ga_obs = df_test$ga
+  
+  pgf = bayesplot::ppc_stat(gf_obs, gf_rep, stat = "mean")
+  pga = bayesplot::ppc_stat(ga_obs, ga_rep, stat = "mean")
+  
+  grid = bayesplot::bayesplot_grid(plots = list(pgf, pga),
+                            titles = c(title, title),
+                            subtitles = c("Home Goals", "Away Goals"))
+  
+  return(grid)
+}
+
+mean_poisson = plot_predictive_mean(poisson_draw, df_test, "Poisson")
+mean_zipoisson = plot_predictive_mean(zipoisson_draw, df_test, "ZIPoisson")
+mean_neg = plot_predictive_mean(negbinom_draw, df_test, "Neg. Binom")
+mean_dyn = plot_predictive_mean(dynamic_draw, df_test, "Dynamic Poisson")
+```
+
+```{r plot mean preditiva 2}
+#| output: true
+
+mean_poisson
+```
+
+# Predição
+
+```{r}
+#| output: true
+mean_zipoisson
+```
+
+# Predição
+```{r}
+#| output: true
+mean_neg
+```
+# Predição
+
+```{r}
+#| output: true
+mean_dyn
+```
+
+# Predição
+
+```{r predict_league}
+predict_league = function(new_data, samples){
+  new_data$home_win = NA
+  new_data$draw = NA
+  new_data$home_lost = NA
+  
+  for(i in 1:nrow(new_data)){
+    x = posterior::draws_of(samples$gf_new)[, i]
+    y = posterior::draws_of(samples$ga_new)[, i]
+    n_preds = posterior::draws_of(samples$gf_new)[ ,i]
+    
+    new_data[i, ]$home_win = sum(x > y)/length(n_preds)
+    new_data[i, ]$draw = sum(x == y)/length(n_preds)
+    new_data[i, ]$home_lost = sum(x < y)/length(n_preds)
+  }
+  
+  predicted_games = new_data %>% 
+    mutate(
+      result_predicted = case_when(
+         home_win >= draw & home_win >= home_lost ~ 'W',  # WIN
+         draw >= home_win & draw >= home_lost ~ 'D', # DRAW
+         TRUE ~ 'L'  # LOSE
+       ),
+      sucess = if_else(result_predicted == result, 1, 0),
+      
+      favorite_actual = ifelse(result %in% c("W", "D"), "Favorite", "Underdog"),
+      favorite_predicted = case_when(
+        home_win + draw >= home_lost ~ "Favorite",
+        home_lost >= home_win + draw ~ "Underdog"
+        ),
+      
+      odds_win = home_win/(1-home_win),
+      odds_draw = draw/(1-draw),
+      odds_lose = home_lost/(1-home_lost)
+      )
+  
+  return(predicted_games)
+}
+
+df_pred_pois = predict_league(df_test, poisson_draw)
+df_pred_zipois = predict_league(df_test, zipoisson_draw)
+df_pred_neg = predict_league(df_test, negbinom_draw)
+df_pred_dyn = predict_league(df_test, dynamic_draw)
+```
+
+```{r pred_likelihood}
+#| output: true
+
+predictive_likelihood = function(df_pred) {
+  predictive_likelihood = df_pred %>%
+    mutate(observed_probability = case_when(
+      sucess == 1 & result == "W" ~ home_win,
+      sucess == 1 & result == "D" ~ draw,
+      sucess == 1 & result == "L" ~ home_lost,
+      TRUE ~ NA_real_
+    )) %>% 
+    filter(sucess == 1) %>%
+    summarise(likelihood = prod(observed_probability, na.rm = TRUE)) %>%
+    pull(likelihood)
+  
+  return(predictive_likelihood)
+}
+
+pred_like_pois = predictive_likelihood(df_pred_pois)
+pred_like_zipois = predictive_likelihood(df_pred_zipois)
+pred_like_neg = predictive_likelihood(df_pred_neg)
+pred_like_dyn = predictive_likelihood(df_pred_dyn)
+
+
+tbl_pred = tibble(
+  "Poisson" = pred_like_pois,
+  "ZIPoisson" = pred_like_zipois,
+  "Neg. Binom." = pred_like_neg,
+  "Dynamic" = pred_like_dyn
+)
+
+kbl(tbl_pred)
+```
+
+# Predição
+
+
+```{r predictions round}
+prob_round = function(df_pred, round) {
+  predictions = df_pred %>% 
+    filter(round == round)
+
+  home_name = str_to_title(str_replace_all(predictions$team_name, "_", " "))
+  away_name = str_to_title(str_replace_all(predictions$opponent, "_", " "))
+  game_names = paste(home_name, " X ", away_name)
+  predictions['game_id'] = as.factor(1:nrow(predictions))
+  predictions['game_name'] = game_names
+  
+  predictions = predictions %>% 
+    select(game_id, game_name, team_name, opponent, home_win, draw, home_lost, gf, ga) %>% 
+    mutate(result = paste0(gf, " - ", ga)) %>% 
+    mutate_at(c("home_win", "draw", "home_lost"), ~.*100) %>% 
+    mutate_at(c("home_win", "draw", "home_lost"), ~round(., 1)) %>% 
+    mutate_at(c("home_win", "draw", "home_lost"), ~paste0(.,"%")) %>% 
+    select(
+      "Partida" = game_name, 
+      "Resultado" = result,
+      "Vitória Mandante" = home_win, 
+      "Empate" = draw, 
+      "Vitória Visitante" = home_lost)
+  
+  return(predictions)
+}
+
+roundpred_pois = prob_round(df_pred_pois, 36)
+roundpred_zipois = prob_round(df_pred_zipois, 36)
+roundpred_neg = prob_round(df_pred_neg, 36)
+roundpred_dyn = prob_round(df_pred_dyn, 36)
+```
+
+```{r}
+#| output: true
+
+kbl(roundpred_pois) %>%
+  kable_styling(bootstrap_options = c("striped")) %>% 
+  column_spec(1, width = "35em") %>% 
+  column_spec(2, bold = T) %>% 
+  column_spec(3, width = "5em") %>% 
+  column_spec(4, width = "5em") %>% 
+  column_spec(5, width = "5em")
+```
+
+
+# Predição
+```{r}
+#| output: true
+kbl(roundpred_zipois) %>%
+  kable_styling(bootstrap_options = c("striped")) %>% 
+  column_spec(1, width = "35em") %>% 
+  column_spec(2, bold = T) %>% 
+  column_spec(3, width = "5em") %>% 
+  column_spec(4, width = "5em") %>% 
+  column_spec(5, width = "5em")
+```
+
+# Predição
+
+```{r}
+#| output: true
+kbl(roundpred_neg) %>%
+  kable_styling(bootstrap_options = c("striped")) %>% 
+  column_spec(1, width = "35em") %>% 
+  column_spec(2, bold = T) %>% 
+  column_spec(3, width = "5em") %>% 
+  column_spec(4, width = "5em") %>% 
+  column_spec(5, width = "5em")
+```
+
+# Predição
+
+```{r}
+#| output: true
+kbl(roundpred_dyn) %>%
+  kable_styling(bootstrap_options = c("striped")) %>% 
+  column_spec(1, width = "35em") %>% 
+  column_spec(2, bold = T) %>% 
+  column_spec(3, width = "5em") %>% 
+  column_spec(4, width = "5em") %>% 
+  column_spec(5, width = "5em")
+```
+
+# Predição - Poisson
+
+```{r expected_freq}
+expected_freq = function(df_pred) {
+  expected_result = df_pred %>%
+    group_by(result) %>%
+    summarise(real_freq = n())
+  
+  expected_result <- expected_result %>%
+    mutate(expected_freq = case_when(
+      result == "W" ~ round(sum(df_pred$home_win),2),
+      result == "D" ~ round(sum(df_pred$draw),2),
+      result == "L" ~ round(sum(df_pred$home_lost),2),
+      TRUE ~ NA_real_
+  ))
+  
+  colnames(expected_result) <- c("Resultado", "Frequência", "Frequência Esperada")
+  
+  return(expected_result)
+}
+
+expected_pois = expected_freq(df_pred_pois)
+expected_zipois = expected_freq(df_pred_zipois)
+expected_neg = expected_freq(df_pred_neg)
+expected_dyn = expected_freq(df_pred_dyn)
+```
+
+```{r}
+#| output: true
+
+kbl(expected_pois)
+```
+
+# Predição - ZIPoisson
+
+```{r}
+#| output: true
+kbl(expected_zipois)
+```
+
+# Predição - Neg. Binomial
+
+```{r}
+#| output: true
+kbl(expected_neg)
+```
+
+# Predição - Dynamic
+
+```{r}
+#| output: true
+kbl(expected_dyn)
+```
+
+# Predição - Poisson
+
+```{r confussion matrix}
+#| output: true
+
+confussion_matrix = function(df_pred) {
+  predicted = factor(df_pred$favorite_predicted)
+  actual = factor(df_pred$favorite_actual)
+  
+  plot = ConfusionTableR::binary_visualiseR(train_labels = predicted,
+                                     truth_labels = actual,
+                                     class_label1 = "Favorite", 
+                                     class_label2 = "Underdog",
+                                     quadrant_col1 = "#28ACB4", 
+                                     quadrant_col2 = "#4397D2", 
+                                     custom_title = "Confusion Matrix", 
+                                     text_col = "black")
+  return(plot)
+}
+```
+
+
+```{r}
+#| output: true
+conmat_pois = confussion_matrix(df_pred_pois)
+```
+
+# Predição - ZIPoisson
+```{r}
+#| output: true
+conmat_zipois = confussion_matrix(df_pred_zipois)
+```
+
+# Predição - Neg. Binomial
+```{r}
+#| output: true
+conmat_neg = confussion_matrix(df_pred_neg)
+```
+
+# Predição - Dynamic
+```{r}
+#| output: true
+conmat_dyn = confussion_matrix(df_pred_dyn)
+```
+

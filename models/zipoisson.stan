@@ -1,101 +1,106 @@
 data {
-  int<lower=1> ngames;
+  //train
   int<lower=1> nteams;
-  int<lower=1, upper=nteams> i[ngames]; // Home team index
-  int<lower=1, upper=nteams> j[ngames]; // Away team index
-  int<lower=0> x[ngames];
-  int<lower=0> y[ngames];
+  int<lower=1> ngames;
+  array[ngames] int team1;
+  array[ngames] int team2;
+  array[ngames] int<lower=0> gf;
+  array[ngames] int<lower=0> ga;
+  //test
+  int<lower=1> ngames_new;
+  array[ngames_new] int team1_new;
+  array[ngames_new] int team2_new;
 }
 
 parameters {
-  vector[nteams] home_raw;
-  vector[nteams] att_raw;
-  vector[nteams] def_raw;
+  sum_to_zero_vector[nteams] att;
+  sum_to_zero_vector[nteams] def;
+  real home;
   real<lower=0, upper=1> pzero_x;
   real<lower=0, upper=1> pzero_y;
 }
 
 transformed parameters {
-  vector[nteams] home;
-  vector[nteams] att;
-  vector[nteams] def;
-  vector[ngames] lambda_log; // Linear predictor Home
-  vector[ngames] mu_log;     // Linear predictor Away
+  vector[ngames] theta1;
+  vector[ngames] theta2;
 
-  // Constrained parameters (ensure sum(att) = 0, sum(def) = 0 and sum(home) = 0)
-  home = home_raw - mean(home_raw);
-  att = att_raw - mean(att_raw);
-  def = def_raw - mean(def_raw);
-
-  lambda_log = att[i] - def[j] + home[i];
-  mu_log = att[j] - def[i];
+  theta1 = (att[team1] - def[team2] + home);
+  theta2 = (att[team2] - def[team1]);
 }
 
 model {
   // Priors
-  home_raw ~ normal(0, 10);
-  att_raw ~ normal(0, 10);
-  def_raw ~ normal(0, 10);
+  att ~ normal (0, 10);
+  def ~ normal (0, 10);
+  home ~ normal (0, 10);
   pzero_x ~ beta(1, 1);
   pzero_y ~ beta(1, 1);
 
   // Likelihood
   for (k in 1:ngames){
     // HOME
-    if (x[k] == 0)
+    if (gf[k] == 0)
       target += log_sum_exp(
         bernoulli_lpmf(1 | pzero_x),
-        bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(x[k] | lambda_log[k])
+        bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(gf[k] | theta1[k])
         );
     else
-      target += bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(x[k] | lambda_log[k]);
+      target += bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(gf[k] | theta1[k]);
 
     // AWAY
-    if (y[k] == 0)
+    if (ga[k] == 0)
       target += log_sum_exp(
         bernoulli_lpmf(1 | pzero_y),
-        bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(y[k] | mu_log[k])
+        bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(ga[k] | theta2[k])
         );
     else
-      target += bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(x[k] | mu_log[k]);
+      target += bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(ga[k] | theta2[k]);
   }
 }
 
 generated quantities {
-  int x_pred[ngames];
-  int y_pred[ngames];
-  vector[ngames] log_lik;
+  vector[ngames] log_lik;         // Log-likelihood for model comparison
+  vector[ngames_new] theta1_new;  // Expected goals for new home teams
+  vector[ngames_new] theta2_new;  // Expected goals for new away teams
+  array[ngames_new] int gf_new;
+  array[ngames_new] int ga_new;
 
-  // Generate predictions
-  for (k in 1:ngames){
-    // HOME PREDICTIONS
-    x_pred[k] = poisson_log_rng(lambda_log[k]);
-    if (x_pred[k] == 0)
-      x_pred[k] = bernoulli_rng(pzero_x) == 1 ? 0 : poisson_log_rng(lambda_log[k]);
-
-    // AWAY PREDICTIONS
-    y_pred[k] = poisson_log_rng(mu_log[k]);
-    if (y_pred[k] == 0)
-      y_pred[k] = bernoulli_rng(pzero_y) == 1 ? 0 : poisson_log_rng(mu_log[k]);
-
-
+  // Log-likelihood for training data
+  for (k in 1:ngames) {
     log_lik[k] = 0;
     // HOME
-    if (x[k] == 0)
+    if (gf[k] == 0)
       log_lik[k] += log_sum_exp(
         bernoulli_lpmf(1 | pzero_x),
-        bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(x[k] | lambda_log[k])
+        bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(gf[k] | theta1[k])
         );
     else
-      log_lik[k] += bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(x[k] | lambda_log[k]);
+      log_lik[k] += bernoulli_lpmf(0 | pzero_x) + poisson_log_lpmf(gf[k] | theta1[k]);
 
     // AWAY
-    if (y[k] == 0)
+    if (ga[k] == 0)
       log_lik[k] += log_sum_exp(
         bernoulli_lpmf(1 | pzero_y),
-        bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(y[k] | mu_log[k])
+        bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(ga[k] | theta2[k])
         );
     else
-      log_lik[k] += bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(x[k] | mu_log[k]);
+      log_lik[k] += bernoulli_lpmf(0 | pzero_y) + poisson_log_lpmf(ga[k] | theta2[k]);
+  }
+
+  // Predictive distributions for test data
+  theta1_new = (att[team1_new] - def[team2_new] + home);
+  theta2_new = (att[team2_new] - def[team1_new]);
+
+  for (k in 1:ngames_new) {
+    gf_new[k] = poisson_log_rng(theta1_new[k]);
+    if (gf_new[k] == 0)
+      gf_new[k] = bernoulli_rng(pzero_x) == 1 ? 0 : poisson_log_rng(theta1_new[k]);
+
+    // AWAY PREDICTIONS
+    ga_new[k] = poisson_log_rng(theta2_new[k]);
+    if (ga_new[k] == 0)
+      ga_new[k] = bernoulli_rng(pzero_y) == 1 ? 0 : poisson_log_rng(theta2_new[k]);
+
   }
 }
+
