@@ -6,21 +6,21 @@ library(tidyverse)
 library(cmdstanr)
 library(posterior)
 library(bayesplot)
-
+library(shinystan)
 library(FootStats)
 ```
 
 ```{r loading df}
 brasileirao_a_raw = FootStats::load_data('brazil', 'brasileirao_a')
-#premier_league_raw = FootStats::load_data('england', 'premier_league')
+premier_league_raw = FootStats::load_data('england', 'premier_league')
 ```
 
 ```{r only home view}
 brasileirao_a = brasileirao_a_raw %>% 
   filter(venue == 'Home')
 
-# premier_league = premier_league_raw %>% 
-#   filter(venue == 'Home')
+premier_league = premier_league_raw %>% 
+  filter(venue == 'Home')
 ```
 
 ```{r train test}
@@ -32,90 +32,28 @@ br_test = br_train_test$test
 
 br = rbind(br_train, br_test)
 
+#BRASILEIRAO COVARIAVEL
+br_train_test_co = FootStats::split_train_test(brasileirao_a_raw, '2024', 35, ('2023'))
+
+br_train_co = br_train_test_co$train |> mutate(season = factor(season))
+br_test_co = br_train_test_co$test
+
+br_co = rbind(br_train_co, br_test_co)
+
 #PREMIER LEAGUE
-# pl_train_test = FootStats::split_train_test(premier_league_raw, '2023', 35)
-# 
-# pl_train = pl_train_test$train
-# pl_test = pl_train_test$test
-# 
-# pl = rbind(br_train, br_test)
-```
+pl_train_test = FootStats::split_train_test(premier_league_raw, '2023', 35)
 
-# DESCRITIVA
+pl_train = pl_train_test$train
+pl_test = pl_train_test$test
 
-```{r dados descritiva}
-df_descritiva = rbind(brasileirao_a, premier_league) %>% 
-  select(
-    "Gols mandante" = gf,
-    "Gols visitante" = ga,
-    "Campeonato" = comp
-    ) %>% 
-  pivot_longer(
-    cols = c(`Gols mandante`, `Gols visitante`),
-    names_to = "gols"
-    )
-```
+pl = rbind(pl_train, pl_test)
 
-```{r distribuicao}
-ggplot(df_descritiva, aes(x = value)) +
-  geom_bar() +
-  facet_grid(Campeonato ~ gols) +
-  labs(
-    title = "Distribuição dos Gols",
-    subtitle = "Brasileirão Série A vs. Premier League - Temporadas 2019 à 2024",
-    x = "Número de gols",
-    y = "Frequência"
-  ) +
-  theme_minimal()
-```
+#GENERATED
+num_teams = 20
+model = "poisson"
+params = list("intercept" = 1, "home" = .5, "sd_att" = 1, "sd_def" = 1)
 
-```{r estatisticas}
-df_descritiva %>% 
-  group_by(Campeonato, gols) %>% 
-  reframe(
-    media = mean(value, na.rm=TRUE),
-    mediana = median(value, na.rm=TRUE),
-    desvio_padrao = sd(value, na.rm=TRUE)
-  )
-```
-
-```{r placares}
-rbind(brasileirao_a, premier_league) |> 
-  mutate(placar = paste0(gf, "x", ga)) %>% 
-  group_by(placar, comp) %>% 
-  count(placar) %>%
-  ungroup() %>% 
-  mutate(
-    pct = round((n / sum(n)) * 100, 1)
-  ) %>% 
-  mutate(
-      category = case_when(
-        str_detect(placar, "0x0") ~ "0x0",
-        str_detect(placar, "0") ~ "Contém 0",
-        TRUE ~ "Outro"
-      )
-    ) %>% 
-  filter(category != "Outro") %>% 
-  group_by(category, comp) %>% 
-  summarise(
-    pct = sum(pct),
-    n = sum(n),
-    .groups = "drop"
-  )
-```
-
-```{r resultados}
-rbind(brasileirao_a, premier_league) |> 
-  group_by(comp) |> 
-  count(result) %>% 
-  filter(result %in% c("W", "D", "L")) %>%
-  mutate(pct = round((n / sum(n)) * 100, 1),
-         result = case_when(
-           result == "D" ~ "Empate",
-           result == "L" ~ "Visitante",
-           result == "W" ~ "Mandante",
-           TRUE ~ "Outro"
-         ))
+gen_data = FootStats::generate_data(num_teams, model, params)
 ```
 
 # MODELAGEM
@@ -124,31 +62,69 @@ rbind(brasileirao_a, premier_league) |>
 #BRASILEIRAO
 data_br = list(
   #treino
-  nteams = length(unique(br_train$team_name_idx)),
-  ngames = nrow(br_train),
-  team1 = br_train$team_name_idx,
-  team2 = br_train$opponent_idx,
-  gf = br_train$gf,
-  ga = br_train$ga,
+  nteams = length(unique(br_train_co$team_name_idx)),
+  ngames = nrow(br_train_co),
+  team1 = br_train_co$team_name_idx,
+  team2 = br_train_co$opponent_idx,
+  gf = br_train_co$gf,
+  ga = br_train_co$ga,
   #test
   ngames_new = nrow(br_test),
   team1_new = br_test$team_name_idx,
   team2_new = br_test$opponent_idx
 )
+#BRASILEIRAO COVARIAVEL
+
+
+X = model.matrix(~ 0+season, data = br_train_co)
+X_new = model.matrix(~ 0+factor(season, levels = levels(br_train_co$season)), data = br_test_co)
+
+data_br_co = list(
+  #treino
+  nteams = length(unique(br_train_co$team_name_idx)),
+  ngames = nrow(br_train_co),
+  team1 = br_train_co$team_name_idx,
+  team2 = br_train_co$opponent_idx,
+  gf = br_train_co$gf,
+  ga = br_train_co$ga,
+  X = X,
+  ncol_X = ncol(X),
+  #test
+  ngames_new = nrow(br_test_co),
+  team1_new = br_test_co$team_name_idx,
+  team2_new = br_test_co$opponent_idx,
+  Xnew = X_new,
+  ncol_Xnew = ncol(X_new)
+)
 #PREMIER LEAGUE
-# data_pl = list(
-#   #treino
-#   nteams = length(unique(pl_train$team_name_idx)),
-#   ngames = nrow(pl_train),
-#   team1 = pl_train$team_name_idx,
-#   team2 = pl_train$opponent_idx,
-#   gf = as.integer(pl_train$gf),
-#   ga = as.integer(pl_train$ga),
-#   #test
-#   ngames_new = nrow(pl_test),
-#   team1_new = pl_test$team_name_idx,
-#   team2_new = pl_test$opponent_idx
-# )
+data_pl = list(
+  #treino
+  nteams = length(unique(pl_train$team_name_idx)),
+  ngames = nrow(pl_train),
+  team1 = pl_train$team_name_idx,
+  team2 = pl_train$opponent_idx,
+  gf = as.integer(pl_train$gf),
+  ga = as.integer(pl_train$ga),
+  #test
+  ngames_new = nrow(pl_test),
+  team1_new = pl_test$team_name_idx,
+  team2_new = pl_test$opponent_idx
+)
+
+#GEN
+data_gen = list(
+  #treino
+  nteams = length(unique(gen_data$data$home_index)),
+  ngames = nrow(gen_data$data),
+  team1 = gen_data$data$home_index,
+  team2 = gen_data$data$away_index,
+  gf = gen_data$data$goals_home,
+  ga = gen_data$data$goals_away,
+  #test
+  ngames_new = nrow(gen_data$data),
+  team1_new = gen_data$data$home_index,
+  team2_new = gen_data$data$away_index
+)
 
 iter = 2500
 warmup = 2500
@@ -157,39 +133,55 @@ cores = 8
 ```
 
 ```{r fit 1_poisson_indep}
-indep_pois = cmdstan_model("models/1_indep_poisson.stan")
+indep_pois = cmdstan_model("models/indep_poisson.stan")
 
-fit_indep_pois = indep_pois$sample(
-                   data = data_br,
+fit = indep_pois$sample(
+                   data = data_pl,
                    iter_sampling = iter,
                    iter_warmup = warmup,
                    chains = chains,
                    parallel_chains = cores,
-                   #max_treedepth = 15,
+                   max_treedepth = 15,
                  )
 
-fit_indep_pois$save_object(file = "results/1_indep_poisson(br).rds")
+fit$save_object(file = "results/indep_poisson(pl).rds")
 ```
 
 ```{r}
-library("shinystan")
-launch_shinystan(fit_indep_pois)
+fit_br = readRDS("results/indep_poisson(br).rds")
+fit_br_co = readRDS("results/indep_poisson(br_co).rds")
+fit_pl = readRDS("results/indep_poisson(pl).rds")
+```
+
+# CONVERGENCIA
+
+```{r}
+launch_shinystan(fit)
 ```
 
 ```{r}
-y1_rep = fit1$draws("gf_new")
-y1_obs = df_test$gf
+fit$summary()
+```
 
-y2_rep = fit1$draws("ga_new")
-y2_obs = df_test$ga
 
-z_rep = y1_rep - y2_rep
-z_obs = y1_obs - y2_obs
+# PREDICAO
+
+```{r}
+draws_br = posterior::as_draws_rvars(fit_br$draws())
+draws_br_co = posterior::as_draws_rvars(fit_br_co$draws())
+draws_pl = posterior::as_draws_rvars(fit_pl$draws())
+#draws_of(draws$def)
 ```
 
 ```{r}
-ppc_bars(y1_obs, y1_rep)
-ppc_bars(y2_obs, y2_rep)
-ppc_bars(z_obs, z_rep)
+predicted_br = FootStats::predict(br_test, draws_br)
+predicted_br_co = FootStats::predict(br_test_co, draws_br_co)
+predicted_pl = FootStats::predict(pl_test, draws_pl)
+```
+
+```{r}
+writexl::write_xlsx(predicted_br, 'data/poisson_br.xlsx')
+writexl::write_xlsx(predicted_br_co, 'data/poisson_br_co.xlsx')
+writexl::write_xlsx(predicted_pl, 'data/poisson_pl.xlsx')
 ```
 
